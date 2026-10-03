@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1/me/feed")
 
+FANOUT_SHUTDOWN_TIMEOUT_SECONDS = 10
+
 _fanout_tasks: set[asyncio.Task] = set()
 
 
@@ -46,7 +48,14 @@ def _fanout_done(task: asyncio.Task) -> None:
 
 
 async def wait_fanout_tasks() -> None:
-    await asyncio.gather(*_fanout_tasks, return_exceptions=True)
+    if not _fanout_tasks:
+        return
+    _, pending = await asyncio.wait(set(_fanout_tasks), timeout=FANOUT_SHUTDOWN_TIMEOUT_SECONDS)
+    if pending:
+        logger.warning("fanout tasks cancelled on shutdown: %d", len(pending))
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def get_publish_fanout(

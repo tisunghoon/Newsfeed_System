@@ -214,3 +214,24 @@ async def test_lifespan_waits_fanout_then_closes_mq_redis_db(monkeypatch):
     async with app.router.lifespan_context(app):
         await post_router.get_publish_fanout(FakeRedis(), channel)({"post_id": "p"})
     assert calls[3:] == ["fanout done", "mq close", "redis close", "db dispose"]
+
+
+async def test_wait_fanout_tasks_cancels_tasks_past_timeout(monkeypatch, caplog):
+    finished = []
+
+    async def fanout(redis, channel, event):
+        await asyncio.sleep(event["delay"])
+        finished.append(event["post_id"])
+
+    monkeypatch.setattr(post_router, "_run_fanout", fanout)
+    monkeypatch.setattr(post_router, "FANOUT_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+    publish = post_router.get_publish_fanout(FakeRedis(), object())
+    await publish({"post_id": "fast", "delay": 0})
+    await publish({"post_id": "stuck", "delay": 10})
+    tasks = set(post_router._fanout_tasks)
+
+    await asyncio.wait_for(post_router.wait_fanout_tasks(), 1)
+    assert finished == ["fast"]
+    assert all(task.done() for task in tasks)
+    assert post_router._fanout_tasks == set()
+    assert "fanout tasks cancelled on shutdown: 1" in caplog.text
