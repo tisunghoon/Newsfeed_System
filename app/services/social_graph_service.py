@@ -52,7 +52,12 @@ class SocialGraphService:
                 raise FriendLimitExceededError
             if await self.repo.are_friends(user_id, target_id):
                 raise AlreadyFriendsError
-            await self.repo.add_friendship(user_id, target_id)
+            try:
+                await self.repo.add_friendship(user_id, target_id)
+            except Exception:
+                if not await self.repo.are_friends(user_id, target_id):
+                    raise
+                raise AlreadyFriendsError from None
         except (UserNotFoundError, FriendLimitExceededError, AlreadyFriendsError):
             raise
         except Exception:

@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 
 import pytest
@@ -45,6 +46,18 @@ async def test_add_and_remove_friend_writes_both_directions(client):
     assert await friendship_rows(user, friend) == 0
     res = await client.delete(path, headers=auth_header(user))
     assert res.status_code == 404
+
+
+async def test_concurrent_mutual_add_returns_201_and_409(client):
+    for _ in range(5):
+        a = await make_user()
+        b = await make_user()
+        results = await asyncio.gather(
+            client.post(f"/v1/me/friends/{b}", headers=auth_header(a)),
+            client.post(f"/v1/me/friends/{a}", headers=auth_header(b)),
+        )
+        assert sorted(res.status_code for res in results) == [201, 409]
+        assert await friendship_rows(a, b) == 2
 
 
 async def test_add_unknown_user_returns_404(client):
