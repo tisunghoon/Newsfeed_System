@@ -66,3 +66,42 @@ class PostService:
             await self.publish_fanout(event)
         except Exception:
             logger.exception("fanout publish failed: %s", event)
+
+    async def delete(self, author_id: str, post_id: uuid.UUID) -> None:
+        try:
+            if not await self.repo.exists_active(post_id, author_id):
+                raise PostNotFoundError
+        except PostNotFoundError:
+            raise
+        except Exception:
+            logger.exception("post lookup failed: %s", post_id)
+            raise PostStorageError from None
+
+        key = _cache_key(post_id)
+        try:
+            snapshot = await self.redis.hgetall(key)
+            ttl = await self.redis.ttl(key)
+            await self.redis.delete(key)
+        except RedisError:
+            logger.exception("post cache delete failed: %s", post_id)
+            raise PostStorageError from None
+
+        try:
+            await self.repo.soft_delete(post_id)
+        except Exception:
+            logger.exception("post soft delete failed: %s", post_id)
+            await self._restore_cache(key, snapshot, ttl)
+            raise PostStorageError from None
+
+        await self._publish({"action": "delete", "post_id": str(post_id), "author_id": author_id})
+
+    async def _restore_cache(self, key: str, snapshot: dict, ttl: int) -> None:
+        if not snapshot:
+            return
+        try:
+            async with self.redis.pipeline() as pipe:
+                pipe.hset(key, mapping=snapshot)
+                pipe.expire(key, ttl if ttl > 0 else POST_CACHE_TTL)
+                await pipe.execute()
+        except RedisError:
+            logger.exception("post cache restore failed: %s", key)
