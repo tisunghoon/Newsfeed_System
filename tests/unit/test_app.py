@@ -7,11 +7,14 @@ import httpx
 from fakeredis.aioredis import FakeRedis
 from fastapi import Depends
 
+from app import main as app_main
+from app.core import rabbitmq_client
 from app.core.logging_config import JsonFormatter
 from app.main import create_app
 from app.middleware import rate_limit
 from app.routers import post as post_router
 from app.routers.deps import get_redis
+from app.services import message_queue
 from app.services.post_service import PostService
 from tests.unit.test_auth_middleware import auth_header
 from tests.unit.test_post_service import VALID, FakeRepo
@@ -138,3 +141,66 @@ async def test_fanout_task_failure_is_logged(monkeypatch, caplog):
     await post_router.wait_fanout_tasks()
     assert res.status_code == 201
     assert "fanout task failed" in caplog.text
+
+
+class FakeConnection:
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def close(self):
+        self.calls.append("mq close")
+
+
+def patch_resources(monkeypatch, calls):
+    connection = FakeConnection(calls)
+    channel = object()
+
+    async def connect():
+        calls.append("connect")
+        return connection
+
+    async def open_channel(conn):
+        assert conn is connection
+        calls.append("open channel")
+        return channel
+
+    async def declare_queues(ch):
+        assert ch is channel
+        calls.append("declare queues")
+
+    async def redis_close():
+        calls.append("redis close")
+
+    async def engine_dispose():
+        calls.append("db dispose")
+
+    monkeypatch.setattr(rabbitmq_client, "connect", connect)
+    monkeypatch.setattr(rabbitmq_client, "open_channel", open_channel)
+    monkeypatch.setattr(message_queue, "declare_queues", declare_queues)
+    monkeypatch.setattr(app_main, "redis_client", SimpleNamespace(aclose=redis_close))
+    monkeypatch.setattr(app_main, "engine", SimpleNamespace(dispose=engine_dispose))
+    return connection, channel
+
+
+async def test_lifespan_declares_queues_and_sets_channel(monkeypatch):
+    calls = []
+    _, channel = patch_resources(monkeypatch, calls)
+    app = create_app(FakeRedis())
+    async with app.router.lifespan_context(app):
+        assert calls == ["connect", "open channel", "declare queues"]
+        assert app.state.mq_channel is channel
+
+
+async def test_lifespan_waits_fanout_then_closes_mq_redis_db(monkeypatch):
+    calls = []
+    _, channel = patch_resources(monkeypatch, calls)
+
+    async def slow_fanout(redis, ch, event):
+        await asyncio.sleep(0.05)
+        calls.append("fanout done")
+
+    monkeypatch.setattr(post_router, "_run_fanout", slow_fanout)
+    app = create_app(FakeRedis())
+    async with app.router.lifespan_context(app):
+        await post_router.get_publish_fanout(FakeRedis(), channel)({"post_id": "p"})
+    assert calls[3:] == ["fanout done", "mq close", "redis close", "db dispose"]
