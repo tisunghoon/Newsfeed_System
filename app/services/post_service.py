@@ -44,11 +44,12 @@ class PostService:
             logger.exception("post insert failed")
             raise PostStorageError from None
 
+        created_at_ms = int(created_at.timestamp() * 1000)
         fields = {
             "author_id": author_id,
             "body": request.body or "",
             "media_json": json.dumps([item.model_dump() for item in request.media]),
-            "created_at": str(int(created_at.timestamp() * 1000)),
+            "created_at": str(created_at_ms),
         }
         try:
             async with self.redis.pipeline() as pipe:
@@ -58,7 +59,14 @@ class PostService:
         except RedisError:
             logger.exception("post cache write failed: %s", post_id)
 
-        await self._publish({"action": "insert", "post_id": str(post_id), "author_id": author_id})
+        await self._publish(
+            {
+                "action": "insert",
+                "post_id": str(post_id),
+                "author_id": author_id,
+                "created_at": created_at_ms,
+            }
+        )
         return PostCreateResponse(post_id=post_id, created_at=created_at)
 
     async def _publish(self, event: dict) -> None:

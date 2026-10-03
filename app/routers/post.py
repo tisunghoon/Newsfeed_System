@@ -1,6 +1,8 @@
 import uuid
 from collections.abc import Awaitable, Callable
+from functools import partial
 
+from aio_pika.abc import AbstractChannel
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
@@ -10,8 +12,12 @@ from app.core.database import get_session
 from app.core.redis_client import redis_client
 from app.schemas.error import ErrorResponse
 from app.schemas.post import PostCreateRequest, PostCreateResponse
+from app.services import message_queue
+from app.services.fanout_service import FanoutService
 from app.services.post_repository import PostRepository
 from app.services.post_service import PostNotFoundError, PostService, PostStorageError
+from app.services.social_graph_repository import SocialGraphRepository
+from app.services.social_graph_service import SocialGraphService
 
 router = APIRouter(prefix="/v1/me/feed")
 
@@ -20,8 +26,22 @@ def get_redis() -> Redis:
     return redis_client
 
 
-def get_publish_fanout() -> Callable[[dict], Awaitable[None]]:
-    raise NotImplementedError("팬아웃 이벤트 발행 구현이 아직 연결되지 않았다")
+def get_mq_channel() -> AbstractChannel:
+    raise NotImplementedError("RabbitMQ 채널은 앱 수명주기 연결 이슈에서 제공한다")
+
+
+def get_publish_fanout(
+    session: AsyncSession = Depends(get_session),
+    redis: Redis = Depends(get_redis),
+    channel: AbstractChannel = Depends(get_mq_channel),
+) -> Callable[[dict], Awaitable[None]]:
+    repo = SocialGraphRepository(session)
+    return FanoutService(
+        SocialGraphService(repo, redis),
+        repo,
+        partial(message_queue.publish_message, channel),
+        partial(message_queue.publish_dead_letter, channel),
+    ).handle
 
 
 def get_post_service(

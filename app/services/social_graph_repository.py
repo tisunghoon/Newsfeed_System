@@ -32,6 +32,13 @@ class SocialGraphRepository:
         query = select(Friendship.friend_id).where(Friendship.user_id == uuid.UUID(user_id))
         return [str(friend_id) for friend_id in await self.session.scalars(query)]
 
+    async def list_excluding_friend_ids(self, author_id: str) -> list[str]:
+        query = select(Friendship.user_id).where(
+            Friendship.friend_id == uuid.UUID(author_id),
+            (Friendship.blocked.is_(True)) | (Friendship.muted.is_(True)),
+        )
+        return [str(user_id) for user_id in await self.session.scalars(query)]
+
     async def add_friendship(self, user_id: str, friend_id: str) -> None:
         a, b = uuid.UUID(user_id), uuid.UUID(friend_id)
         try:
