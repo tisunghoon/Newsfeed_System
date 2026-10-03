@@ -86,7 +86,14 @@ async def test_create_stores_post_and_cache():
     assert cached["author_id"] == "user-1"
     assert cached["body"] == "hello"
     assert 0 < await h.redis.ttl(f"post:{post_id}") <= 86_400
-    assert h.events == [{"action": "insert", "post_id": post_id, "author_id": "user-1"}]
+    assert h.events == [
+        {
+            "action": "insert",
+            "post_id": post_id,
+            "author_id": "user-1",
+            "created_at": int(cached["created_at"]),
+        }
+    ]
 
 
 async def test_create_db_failure_skips_cache_and_returns_500():
