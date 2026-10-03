@@ -30,3 +30,5 @@ include = ["app*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
+addopts = "-m 'not integration'"
+markers = ["integration: 실제 PostgreSQL, Redis, RabbitMQ가 필요한 통합 테스트"]
