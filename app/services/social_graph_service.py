@@ -60,6 +60,46 @@ class SocialGraphService:
             raise SocialGraphStorageError from None
         await self._invalidate(user_id, target_id)
 
+    async def remove_friend(self, user_id: str, target_id: str) -> None:
+        try:
+            if not await self.repo.are_friends(user_id, target_id):
+                raise FriendshipNotFoundError
+            await self.repo.remove_friendship(user_id, target_id)
+        except FriendshipNotFoundError:
+            raise
+        except Exception:
+            logger.exception("friend remove failed: %s -> %s", user_id, target_id)
+            raise SocialGraphStorageError from None
+        await self._invalidate(user_id, target_id)
+
+    async def get_friend_ids(self, user_id: str) -> list[str]:
+        try:
+            cached = await self.redis.smembers(_friends_key(user_id))
+        except RedisError:
+            logger.exception("friends cache read failed: %s", user_id)
+            cached = None
+        if cached:
+            return list(cached)
+
+        try:
+            friend_ids = await self.repo.list_friend_ids(user_id)
+        except Exception:
+            logger.exception("friend list lookup failed: %s", user_id)
+            raise SocialGraphStorageError from None
+        await self._fill_cache(user_id, friend_ids)
+        return friend_ids
+
+    async def _fill_cache(self, user_id: str, friend_ids: list[str]) -> None:
+        try:
+            async with self.redis.pipeline() as pipe:
+                if friend_ids:
+                    pipe.sadd(_friends_key(user_id), *friend_ids)
+                    pipe.expire(_friends_key(user_id), FRIENDS_CACHE_TTL)
+                pipe.set(_count_key(user_id), len(friend_ids), ex=FRIENDS_CACHE_TTL)
+                await pipe.execute()
+        except RedisError:
+            logger.exception("friends cache fill failed: %s", user_id)
+
     async def _invalidate(self, *user_ids: str) -> None:
         keys = [key for user_id in user_ids for key in (_friends_key(user_id), _count_key(user_id))]
         try:
