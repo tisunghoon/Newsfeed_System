@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from functools import partial
@@ -8,8 +10,8 @@ from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.database import get_session
-from app.routers.deps import get_redis
+from app.core.database import async_session, get_session
+from app.routers.deps import get_mq_channel, get_redis
 from app.schemas.error import ErrorResponse
 from app.schemas.post import PostCreateRequest, PostCreateResponse
 from app.services import message_queue
@@ -19,25 +21,44 @@ from app.services.post_service import PostNotFoundError, PostService, PostStorag
 from app.services.social_graph_repository import SocialGraphRepository
 from app.services.social_graph_service import SocialGraphService
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/v1/me/feed")
 
+_fanout_tasks: set[asyncio.Task] = set()
 
-def get_mq_channel() -> AbstractChannel:
-    raise NotImplementedError("RabbitMQ 채널은 앱 수명주기 연결 이슈에서 제공한다")
+
+async def _run_fanout(redis: Redis, channel: AbstractChannel, event: dict) -> None:
+    async with async_session() as session:
+        repo = SocialGraphRepository(session)
+        await FanoutService(
+            SocialGraphService(repo, redis),
+            repo,
+            partial(message_queue.publish_message, channel),
+            partial(message_queue.publish_dead_letter, channel),
+        ).handle(event)
+
+
+def _fanout_done(task: asyncio.Task) -> None:
+    _fanout_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.error("fanout task failed", exc_info=task.exception())
+
+
+async def wait_fanout_tasks() -> None:
+    await asyncio.gather(*_fanout_tasks, return_exceptions=True)
 
 
 def get_publish_fanout(
-    session: AsyncSession = Depends(get_session),
     redis: Redis = Depends(get_redis),
     channel: AbstractChannel = Depends(get_mq_channel),
 ) -> Callable[[dict], Awaitable[None]]:
-    repo = SocialGraphRepository(session)
-    return FanoutService(
-        SocialGraphService(repo, redis),
-        repo,
-        partial(message_queue.publish_message, channel),
-        partial(message_queue.publish_dead_letter, channel),
-    ).handle
+    async def publish(event: dict) -> None:
+        task = asyncio.create_task(_run_fanout(redis, channel, event))
+        _fanout_tasks.add(task)
+        task.add_done_callback(_fanout_done)
+
+    return publish
 
 
 def get_post_service(
