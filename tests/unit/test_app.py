@@ -102,20 +102,28 @@ async def test_unhandled_error_returns_500_and_json_log(caplog):
     assert "timestamp" in entry
 
 
-async def test_fanout_runs_after_response(monkeypatch):
+async def test_fanout_runs_after_response_in_its_own_session(monkeypatch):
     gate = asyncio.Event()
     handled = []
+    sessions = []
+
+    @contextlib.asynccontextmanager
+    async def session_factory():
+        session = SimpleNamespace(closed=False)
+        sessions.append(session)
+        yield session
+        session.closed = True
 
     class GatedFanout:
-        def __init__(self, *args):
-            pass
+        def __init__(self, social_graph_service, repo, *args):
+            self.repo = repo
 
         async def handle(self, event):
             await gate.wait()
-            handled.append(event)
+            handled.append((event, self.repo.session))
 
     monkeypatch.setattr(post_router, "FanoutService", GatedFanout)
-    monkeypatch.setattr(post_router, "async_session", contextlib.nullcontext)
+    monkeypatch.setattr(post_router, "async_session", session_factory)
     async with client_for(make_app()) as client:
         res = await asyncio.wait_for(client.post(FEED, json=VALID, headers=auth_header()), 1)
     assert res.status_code == 201
@@ -123,7 +131,9 @@ async def test_fanout_runs_after_response(monkeypatch):
 
     gate.set()
     await post_router.wait_fanout_tasks()
-    assert [event["post_id"] for event in handled] == [res.json()["post_id"]]
+    assert len(sessions) == 1
+    assert [(event["post_id"], session) for event, session in handled] == [(res.json()["post_id"], sessions[0])]
+    assert sessions[0].closed
 
 
 async def test_fanout_task_failure_is_logged(monkeypatch, caplog):
