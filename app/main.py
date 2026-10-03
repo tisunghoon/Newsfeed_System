@@ -17,14 +17,24 @@ from app.services import message_queue
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     connection = await rabbitmq_client.connect()
-    channel = await rabbitmq_client.open_channel(connection)
-    await message_queue.declare_queues(channel)
+    try:
+        channel = await rabbitmq_client.open_channel(connection)
+        await message_queue.declare_queues(channel)
+    except BaseException:
+        await connection.close()
+        raise
     app.state.mq_channel = channel
     yield
-    await post.wait_fanout_tasks()
-    await connection.close()
-    await redis_client.aclose()
-    await engine.dispose()
+    try:
+        await post.wait_fanout_tasks()
+    finally:
+        try:
+            await connection.close()
+        finally:
+            try:
+                await redis_client.aclose()
+            finally:
+                await engine.dispose()
 
 
 def create_app(redis: Redis = redis_client) -> FastAPI:

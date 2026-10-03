@@ -4,6 +4,7 @@ import json
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from fakeredis.aioredis import FakeRedis
 from fastapi import Depends
 
@@ -235,3 +236,34 @@ async def test_wait_fanout_tasks_cancels_tasks_past_timeout(monkeypatch, caplog)
     assert all(task.done() for task in tasks)
     assert post_router._fanout_tasks == set()
     assert "fanout tasks cancelled on shutdown: 1" in caplog.text
+
+
+async def test_lifespan_closes_mq_when_declare_queues_fails(monkeypatch):
+    calls = []
+    patch_resources(monkeypatch, calls)
+
+    async def broken_declare(channel):
+        raise RuntimeError("declare failed")
+
+    monkeypatch.setattr(message_queue, "declare_queues", broken_declare)
+    app = create_app(FakeRedis())
+    with pytest.raises(RuntimeError, match="declare failed"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert calls == ["connect", "open channel", "mq close"]
+
+
+async def test_lifespan_cleans_redis_and_db_when_mq_close_fails(monkeypatch):
+    calls = []
+    connection, _ = patch_resources(monkeypatch, calls)
+
+    async def broken_close():
+        calls.append("mq close")
+        raise RuntimeError("close failed")
+
+    connection.close = broken_close
+    app = create_app(FakeRedis())
+    with pytest.raises(RuntimeError, match="close failed"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert calls[3:] == ["mq close", "redis close", "db dispose"]
