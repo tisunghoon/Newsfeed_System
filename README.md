@@ -43,3 +43,11 @@ Fanout_Worker 실행 (별도 터미널):
 ```bash
 .venv/bin/pytest
 ```
+
+통합 테스트 (`docker compose up -d` 상태에서 실행):
+
+```bash
+.venv/bin/pytest -m integration
+```
+
+통합 테스트는 `newsfeed_test` DB를 새로 만들어 마이그레이션을 적용하고 끝나면 지운다. Redis는 15번 DB, RabbitMQ는 `newsfeed_test` vhost를 쓴다(관리 API 15672 포트로 생성). 컨테이너에 접속할 수 없으면 건너뛰지 않고 실패한다.

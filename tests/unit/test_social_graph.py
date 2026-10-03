@@ -101,6 +101,18 @@ async def test_add_duplicate_returns_409():
     assert len(h.repo.pairs) == 2
 
 
+async def test_add_losing_concurrent_insert_returns_409():
+    class RacingRepo(FakeRepo):
+        async def add_friendship(self, user_id, friend_id):
+            self.pairs |= {(user_id, friend_id), (friend_id, user_id)}
+            raise RuntimeError("duplicate key value violates unique constraint")
+
+    h = Harness(repo=RacingRepo())
+    res = await add_friend(h, new_user(h))
+    assert res.status_code == 409
+    assert res.json()["code"] == "ALREADY_FRIENDS"
+
+
 async def test_add_over_limit_returns_409():
     h = Harness()
     h.repo.pairs = {(ME, f"other-{i}") for i in range(FRIEND_LIMIT)}
