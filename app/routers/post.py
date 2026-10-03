@@ -26,12 +26,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/me/feed")
 
 FANOUT_SHUTDOWN_TIMEOUT_SECONDS = 10
+FANOUT_CONCURRENCY_LIMIT = 20
 
 _fanout_tasks: set[asyncio.Task] = set()
+_fanout_semaphore = asyncio.Semaphore(FANOUT_CONCURRENCY_LIMIT)
 
 
 async def _run_fanout(redis: Redis, channel: AbstractChannel, event: dict) -> None:
-    async with async_session() as session:
+    async with _fanout_semaphore, async_session() as session:
         repo = SocialGraphRepository(session)
         await FanoutService(
             SocialGraphService(repo, redis),

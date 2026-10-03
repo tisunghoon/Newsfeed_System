@@ -267,3 +267,36 @@ async def test_lifespan_cleans_redis_and_db_when_mq_close_fails(monkeypatch):
         async with app.router.lifespan_context(app):
             pass
     assert calls[3:] == ["mq close", "redis close", "db dispose"]
+
+
+async def test_fanout_concurrency_is_limited(monkeypatch):
+    limit = post_router.FANOUT_CONCURRENCY_LIMIT
+    gate = asyncio.Event()
+    running = []
+    peak = []
+    handled = []
+
+    class TrackedFanout:
+        def __init__(self, *args):
+            pass
+
+        async def handle(self, event):
+            running.append(event)
+            peak.append(len(running))
+            await gate.wait()
+            running.remove(event)
+            handled.append(event)
+
+    monkeypatch.setattr(post_router, "FanoutService", TrackedFanout)
+    monkeypatch.setattr(post_router, "async_session", contextlib.nullcontext)
+    monkeypatch.setattr(post_router, "_fanout_semaphore", asyncio.Semaphore(limit))
+    publish = post_router.get_publish_fanout(FakeRedis(), object())
+    for i in range(limit + 5):
+        await publish({"post_id": str(i)})
+    await asyncio.sleep(0.01)
+    assert len(running) == limit
+
+    gate.set()
+    await post_router.wait_fanout_tasks()
+    assert max(peak) == limit
+    assert len(handled) == limit + 5
