@@ -24,6 +24,20 @@ docker compose up -d
 .venv/bin/alembic upgrade head
 ```
 
+앱 서버 실행:
+
+```bash
+.venv/bin/uvicorn app.main:app
+```
+
+Fanout_Worker 실행 (별도 터미널):
+
+```bash
+.venv/bin/python worker_main.py
+```
+
+푸시 알림은 실제로 보내지 않는다. FCM/APNs 연동 전까지 `log_push`가 로그만 남긴다.
+
 테스트 (외부 서비스 없이 실행됨):
 
 ```bash
