@@ -1,0 +1,302 @@
+import asyncio
+import contextlib
+import json
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from fakeredis.aioredis import FakeRedis
+from fastapi import Depends
+
+from app import main as app_main
+from app.core import rabbitmq_client
+from app.core.logging_config import JsonFormatter
+from app.main import create_app
+from app.middleware import rate_limit
+from app.routers import post as post_router
+from app.routers.deps import get_redis
+from app.services import message_queue
+from app.services.post_service import PostService
+from tests.unit.test_auth_middleware import auth_header
+from tests.unit.test_post_service import VALID, FakeRepo
+
+FEED = "/v1/me/feed"
+
+
+def make_app(publish=None):
+    redis = FakeRedis(decode_responses=True)
+    app = create_app(redis)
+    app.state.mq_channel = object()
+    app.dependency_overrides[get_redis] = lambda: redis
+    repo = FakeRepo()
+
+    def post_service(real_publish=Depends(post_router.get_publish_fanout)):
+        return PostService(repo, redis, publish or real_publish)
+
+    app.dependency_overrides[post_router.get_post_service] = post_service
+    return app
+
+
+def client_for(app) -> httpx.AsyncClient:
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    return httpx.AsyncClient(transport=transport, base_url="http://test")
+
+
+async def no_publish(event):
+    pass
+
+
+async def test_routers_are_registered():
+    paths = create_app(FakeRedis()).openapi()["paths"]
+    assert {path: set(ops) for path, ops in paths.items()} == {
+        "/v1/me/feed": {"get", "post"},
+        "/v1/me/feed/{post_id}": {"delete"},
+        "/v1/me/friends/{target_user_id}": {"post", "delete"},
+    }
+
+
+async def test_missing_token_returns_401():
+    async with client_for(make_app()) as client:
+        for method, path in [("GET", FEED), ("POST", FEED), ("POST", "/v1/me/friends/x")]:
+            res = await client.request(method, path)
+            assert res.status_code == 401
+            assert res.json()["code"] == "MISSING_TOKEN"
+
+
+async def test_invalid_input_returns_400():
+    async with client_for(make_app(no_publish)) as client:
+        res = await client.post(FEED, json={**VALID, "media": []}, headers=auth_header())
+    assert res.status_code == 400
+    assert res.json()["code"] == "VALIDATION_ERROR"
+
+
+async def test_rate_limit_returns_429(monkeypatch):
+    monkeypatch.setattr(rate_limit, "time", SimpleNamespace(time=lambda: 1_700_000_000.0))
+    async with client_for(make_app(no_publish)) as client:
+        statuses = [(await client.post(FEED, json=VALID, headers=auth_header())).status_code for _ in range(101)]
+        res = await client.post(FEED, json=VALID, headers=auth_header())
+    assert statuses[:100] == [201] * 100
+    assert statuses[100] == 429
+    assert res.json() == {"retry_after": 60, "code": "RATE_LIMIT_EXCEEDED"}
+
+
+async def test_unhandled_error_returns_500_and_json_log(caplog):
+    app = make_app()
+
+    @app.get("/boom")
+    async def boom():
+        raise RuntimeError("boom")
+
+    async with client_for(app) as client:
+        res = await client.get("/boom", headers=auth_header("user-9"))
+    assert res.status_code == 500
+    assert res.json() == {"error": "서버 내부 오류가 발생했습니다", "code": "INTERNAL_ERROR"}
+
+    record = next(r for r in caplog.records if r.name == "web_server")
+    entry = json.loads(JsonFormatter().format(record))
+    assert entry["level"] == "ERROR"
+    assert entry["service"] == "web_server"
+    assert entry["user_id"] == "user-9"
+    assert entry["error_code"] == "INTERNAL_ERROR"
+    assert "GET /boom" in entry["message"]
+    assert "RuntimeError: boom" in entry["details"]
+    assert "timestamp" in entry
+
+
+async def test_fanout_runs_after_response_in_its_own_session(monkeypatch):
+    gate = asyncio.Event()
+    handled = []
+    sessions = []
+
+    @contextlib.asynccontextmanager
+    async def session_factory():
+        session = SimpleNamespace(closed=False)
+        sessions.append(session)
+        yield session
+        session.closed = True
+
+    class GatedFanout:
+        def __init__(self, social_graph_service, repo, *args):
+            self.repo = repo
+
+        async def handle(self, event):
+            await gate.wait()
+            handled.append((event, self.repo.session))
+
+    monkeypatch.setattr(post_router, "FanoutService", GatedFanout)
+    monkeypatch.setattr(post_router, "async_session", session_factory)
+    async with client_for(make_app()) as client:
+        res = await asyncio.wait_for(client.post(FEED, json=VALID, headers=auth_header()), 1)
+    assert res.status_code == 201
+    assert handled == []
+
+    gate.set()
+    await post_router.wait_fanout_tasks()
+    assert len(sessions) == 1
+    assert [(event["post_id"], session) for event, session in handled] == [(res.json()["post_id"], sessions[0])]
+    assert sessions[0].closed
+
+
+async def test_fanout_task_failure_is_logged(monkeypatch, caplog):
+    class BrokenFanout:
+        def __init__(self, *args):
+            pass
+
+        async def handle(self, event):
+            raise RuntimeError("session failed")
+
+    monkeypatch.setattr(post_router, "FanoutService", BrokenFanout)
+    monkeypatch.setattr(post_router, "async_session", contextlib.nullcontext)
+    async with client_for(make_app()) as client:
+        res = await client.post(FEED, json=VALID, headers=auth_header())
+    await post_router.wait_fanout_tasks()
+    assert res.status_code == 201
+    assert "fanout task failed" in caplog.text
+
+
+class FakeConnection:
+    def __init__(self, calls):
+        self.calls = calls
+
+    async def close(self):
+        self.calls.append("mq close")
+
+
+def patch_resources(monkeypatch, calls):
+    connection = FakeConnection(calls)
+    channel = object()
+
+    async def connect():
+        calls.append("connect")
+        return connection
+
+    async def open_channel(conn):
+        assert conn is connection
+        calls.append("open channel")
+        return channel
+
+    async def declare_queues(ch):
+        assert ch is channel
+        calls.append("declare queues")
+
+    async def redis_close():
+        calls.append("redis close")
+
+    async def engine_dispose():
+        calls.append("db dispose")
+
+    monkeypatch.setattr(rabbitmq_client, "connect", connect)
+    monkeypatch.setattr(rabbitmq_client, "open_channel", open_channel)
+    monkeypatch.setattr(message_queue, "declare_queues", declare_queues)
+    monkeypatch.setattr(app_main, "redis_client", SimpleNamespace(aclose=redis_close))
+    monkeypatch.setattr(app_main, "engine", SimpleNamespace(dispose=engine_dispose))
+    return connection, channel
+
+
+async def test_lifespan_declares_queues_and_sets_channel(monkeypatch):
+    calls = []
+    _, channel = patch_resources(monkeypatch, calls)
+    app = create_app(FakeRedis())
+    async with app.router.lifespan_context(app):
+        assert calls == ["connect", "open channel", "declare queues"]
+        assert app.state.mq_channel is channel
+
+
+async def test_lifespan_waits_fanout_then_closes_mq_redis_db(monkeypatch):
+    calls = []
+    _, channel = patch_resources(monkeypatch, calls)
+
+    async def slow_fanout(redis, ch, event):
+        await asyncio.sleep(0.05)
+        calls.append("fanout done")
+
+    monkeypatch.setattr(post_router, "_run_fanout", slow_fanout)
+    app = create_app(FakeRedis())
+    async with app.router.lifespan_context(app):
+        await post_router.get_publish_fanout(FakeRedis(), channel)({"post_id": "p"})
+    assert calls[3:] == ["fanout done", "mq close", "redis close", "db dispose"]
+
+
+async def test_wait_fanout_tasks_cancels_tasks_past_timeout(monkeypatch, caplog):
+    finished = []
+
+    async def fanout(redis, channel, event):
+        await asyncio.sleep(event["delay"])
+        finished.append(event["post_id"])
+
+    monkeypatch.setattr(post_router, "_run_fanout", fanout)
+    monkeypatch.setattr(post_router, "FANOUT_SHUTDOWN_TIMEOUT_SECONDS", 0.05)
+    publish = post_router.get_publish_fanout(FakeRedis(), object())
+    await publish({"post_id": "fast", "delay": 0})
+    await publish({"post_id": "stuck", "delay": 10})
+    tasks = set(post_router._fanout_tasks)
+
+    await asyncio.wait_for(post_router.wait_fanout_tasks(), 1)
+    assert finished == ["fast"]
+    assert all(task.done() for task in tasks)
+    assert post_router._fanout_tasks == set()
+    assert "fanout tasks cancelled on shutdown: 1" in caplog.text
+
+
+async def test_lifespan_closes_mq_when_declare_queues_fails(monkeypatch):
+    calls = []
+    patch_resources(monkeypatch, calls)
+
+    async def broken_declare(channel):
+        raise RuntimeError("declare failed")
+
+    monkeypatch.setattr(message_queue, "declare_queues", broken_declare)
+    app = create_app(FakeRedis())
+    with pytest.raises(RuntimeError, match="declare failed"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert calls == ["connect", "open channel", "mq close"]
+
+
+async def test_lifespan_cleans_redis_and_db_when_mq_close_fails(monkeypatch):
+    calls = []
+    connection, _ = patch_resources(monkeypatch, calls)
+
+    async def broken_close():
+        calls.append("mq close")
+        raise RuntimeError("close failed")
+
+    connection.close = broken_close
+    app = create_app(FakeRedis())
+    with pytest.raises(RuntimeError, match="close failed"):
+        async with app.router.lifespan_context(app):
+            pass
+    assert calls[3:] == ["mq close", "redis close", "db dispose"]
+
+
+async def test_fanout_concurrency_is_limited(monkeypatch):
+    limit = post_router.FANOUT_CONCURRENCY_LIMIT
+    gate = asyncio.Event()
+    running = []
+    peak = []
+    handled = []
+
+    class TrackedFanout:
+        def __init__(self, *args):
+            pass
+
+        async def handle(self, event):
+            running.append(event)
+            peak.append(len(running))
+            await gate.wait()
+            running.remove(event)
+            handled.append(event)
+
+    monkeypatch.setattr(post_router, "FanoutService", TrackedFanout)
+    monkeypatch.setattr(post_router, "async_session", contextlib.nullcontext)
+    monkeypatch.setattr(post_router, "_fanout_semaphore", asyncio.Semaphore(limit))
+    publish = post_router.get_publish_fanout(FakeRedis(), object())
+    for i in range(limit + 5):
+        await publish({"post_id": str(i)})
+    await asyncio.sleep(0.01)
+    assert len(running) == limit
+
+    gate.set()
+    await post_router.wait_fanout_tasks()
+    assert max(peak) == limit
+    assert len(handled) == limit + 5

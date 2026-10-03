@@ -6,7 +6,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
-from app.core.redis_client import redis_client
+from app.routers.deps import get_redis
 from app.schemas.error import ErrorResponse
 from app.services.social_graph_repository import SocialGraphRepository
 from app.services.social_graph_service import (
@@ -19,10 +19,6 @@ from app.services.social_graph_service import (
 )
 
 router = APIRouter(prefix="/v1/me/friends")
-
-
-def get_redis() -> Redis:
-    return redis_client
 
 
 def get_social_graph_service(

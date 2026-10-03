@@ -4,7 +4,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_session
-from app.routers.post import get_redis
+from app.routers.deps import get_redis
 from app.schemas.error import ErrorResponse
 from app.schemas.post import FeedResponse
 from app.services.newsfeed_repository import NewsfeedRepository
