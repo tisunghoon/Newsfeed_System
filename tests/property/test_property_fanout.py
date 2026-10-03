@@ -1,9 +1,11 @@
 import asyncio
 
+import fakeredis.aioredis
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from app.services.fanout_service import PUSH_FOLLOWER_LIMIT
+from app.workers.fanout_worker import NEWSFEED_MAX_SIZE, FanoutWorker
 from tests.unit.test_fanout_service import INSERT, Harness
 
 USER_IDS = st.uuids().map(str)
@@ -49,3 +51,26 @@ def test_publish_retries_at_most_three_times(failures):
         assert h.attempts == 3
         assert h.sent == []
         assert len(h.dead) == 1
+
+
+# Feature: newsfeed-system, Property 10: Newsfeed_Cache 크기는 항상 500개 이하로 유지된다
+@given(count=st.integers(min_value=1, max_value=600))
+@settings(max_examples=100, deadline=None)
+def test_newsfeed_cache_never_exceeds_limit(count):
+    async def run():
+        redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+
+        async def send_notifications(post_id, friend_ids):
+            pass
+
+        worker = FanoutWorker(redis, send_notifications)
+        for i in range(count):
+            await worker.handle(
+                {"post_id": f"p{i}", "friend_ids": ["user"], "action": "insert", "created_at": i}
+            )
+            assert await redis.zcard("newsfeed:user") <= NEWSFEED_MAX_SIZE
+        return await redis.zrange("newsfeed:user", 0, -1)
+
+    members = asyncio.run(run())
+    kept = min(count, NEWSFEED_MAX_SIZE)
+    assert members == [f"p{i}" for i in range(count - kept, count)]
